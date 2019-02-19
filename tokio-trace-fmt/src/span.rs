@@ -47,8 +47,16 @@ enum State {
     Empty(usize),
 }
 
+struct Current {
+    stack: Vec<Id>,
+    change: isize,
+}
+
 thread_local! {
-    static CONTEXT: RefCell<Vec<Id>> = RefCell::new(vec![]);
+    static CONTEXT: RefCell<Current> = RefCell::new(Current {
+        stack: vec![],
+        change: 0,
+    });
 }
 
 // ===== impl Span =====
@@ -105,6 +113,7 @@ impl<'a> Context<'a> {
             .try_with(|current| {
                 current
                     .borrow()
+                    .stack
                     .last()
                     .map(|id| dispatcher::with(|subscriber| subscriber.clone_span(id)))
             })
@@ -113,14 +122,49 @@ impl<'a> Context<'a> {
 
     pub(crate) fn push(id: Id) {
         let _ = CONTEXT.try_with(|current| {
-            current.borrow_mut().push(id.clone());
+            let mut current = current.borrow_mut();
+            current.stack.push(id.clone());
+            current.change += 1;
         });
     }
 
     pub(crate) fn pop() -> Option<Id> {
         CONTEXT
-            .try_with(|current| current.borrow_mut().pop())
+            .try_with(|current| {
+                let mut current = current.borrow_mut();
+                current.change -= 1;
+                current.stack.pop()
+            })
             .ok()?
+    }
+
+    pub fn format_spans<F, W>(&self, fmt: &mut W, mut f: F) -> fmt::Result
+    where
+        F: FnMut(&Id, Span, &mut fmt::Write) -> fmt::Result,
+        W: fmt::Write,
+    {
+        thread_local! {
+            static CACHE: RefCell<String> = RefCell::new(String::new());
+        }
+        CONTEXT.try_with(|current| {
+            CACHE.with(|cache| {
+                let change = current.borrow().change;
+                if change != 0 {
+                    let mut cache = cache.borrow_mut();
+                    if change == 1 {
+                        if let Some(e) = self.with_current(|(id, span)| f(id, span, &mut *cache)) {
+                            e?;
+                        }
+                    } else {
+                        cache.clear();
+                        self.visit_spans(|id, span| f(id, span, &mut *cache))?;
+                    }
+                    current.borrow_mut().change = 0;
+                }
+
+                write!(fmt, "{}", *cache.borrow())
+            })
+        }).unwrap_or(Ok(()))
     }
 
     /// Applies a function to each span in the current trace context.
@@ -139,7 +183,7 @@ impl<'a> Context<'a> {
     {
         CONTEXT
             .try_with(|current| {
-                if let Some(id) = current.borrow().last() {
+                if let Some(id) = current.borrow().stack.last() {
                     if let Ok(store) = self.lock.read() {
                         if let Some(span) = store.get(id) {
                             // with_parent uses the call stack to visit the span
@@ -163,7 +207,7 @@ impl<'a> Context<'a> {
         // will just do nothing rather than cause a double panic.
         CONTEXT
             .try_with(|current| {
-                if let Some(id) = current.borrow().last() {
+                if let Some(id) = current.borrow().stack.last() {
                     let spans = self.lock.read().ok()?;
                     if let Some(span) = spans.get(id) {
                         return Some(f((id, span)));
