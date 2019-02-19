@@ -105,11 +105,7 @@ impl<'a> fmt::Display for FmtCtx<'a> {
             }
             seen = true;
             write!(f, "{}", Style::new().bold().paint(span.name()))
-        })?;
-        if seen {
-            f.pad(" ")?;
-        }
-        Ok(())
+        })
     }
 }
 
@@ -123,11 +119,7 @@ impl<'a> fmt::Display for FmtCtx<'a> {
             }
             seen = true;
             write!(f, "{}", span.name())
-        })?;
-        if seen {
-            f.pad(" ")?;
-        }
-        Ok(())
+        })
     }
 }
 
@@ -147,11 +139,7 @@ impl<'a> fmt::Display for FullCtx<'a> {
                 write!(f, "{}{}{}", style.paint("{"), fields, style.paint("}"))?;
             }
             write!(f, ":")
-        })?;
-        if seen {
-            f.pad(" ")?;
-        }
-        Ok(())
+        })
     }
 }
 
@@ -168,11 +156,7 @@ impl<'a> fmt::Display for FullCtx<'a> {
                 write!(f, "{{{}}}", fields)?;
             }
             write!(f, ":")
-        })?;
-        if seen {
-            f.pad(" ")?;
-        }
-        Ok(())
+        })
     }
 }
 

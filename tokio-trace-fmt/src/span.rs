@@ -162,7 +162,7 @@ impl<'a> Context<'a> {
                     if let Some(id) = current.borrow().stack.last() {
                         if let Ok(store) = self.lock.read() {
                             if let Some(span) = store.get(id) {
-                                let change2 = *change;
+                                let change2 = change.clone();
                                 span.with_parent(id, &mut |id, span: Span| {
                                     if writing_to_cache {
                                         if span.is_complete() {
@@ -187,8 +187,12 @@ impl<'a> Context<'a> {
                     self.visit_spans(|id, span| f(id, span, &mut *cache))?;
                     change = 0;
                 }
+                let cache = cache.borrow();
                 if change == 0 {
-                    write!(fmt, "{}", *cache.borrow())?;
+                    write!(fmt, "{}", *cache)?;
+                }
+                if cache.len() > 0 {
+                    write!(fmt, " ")?;
                 }
                 current.borrow_mut().change = change;
                 Ok(())
