@@ -33,6 +33,7 @@ pub(crate) struct Data {
     name: &'static str,
     ref_count: AtomicUsize,
     is_empty: bool,
+    is_complete: bool,
 }
 
 #[derive(Debug)]
@@ -91,14 +92,20 @@ impl<'a> Span<'a> {
         true
     }
 
+    pub(crate) fn is_complete(&self) -> bool {
+        self.data.is_complete
+    }
+
     #[inline(always)]
-    fn with_parent<'store, F, E>(self, my_id: &Id, f: &mut F, store: &'store Slab) -> Result<(), E>
+    fn with_parent<'store, F, E>(self, my_id: &Id, f: &mut F, store: &'store Slab, remaining: isize) -> Result<(), E>
     where
         F: FnMut(&Id, Span) -> Result<(), E>,
     {
         if let Some(parent_id) = self.data.parent.as_ref() {
             if let Some(parent) = store.get(parent_id) {
-                parent.with_parent(parent_id, f, store)?;
+                if remaining != 0 {
+                    parent.with_parent(parent_id, f, store, remaining - 1)?;
+                }
             }
         }
         f(my_id, self)
@@ -148,21 +155,43 @@ impl<'a> Context<'a> {
         }
         CONTEXT.try_with(|current| {
             CACHE.with(|cache| {
-                let change = current.borrow().change;
-                if change != 0 {
+                let mut change = current.borrow().change;
+                if change > 0 {
                     let mut cache = cache.borrow_mut();
-                    if change == 1 {
-                        if let Some(e) = self.with_current(|(id, span)| f(id, span, &mut *cache)) {
-                            e?;
+                    let mut writing_to_cache = true;
+                    if let Some(id) = current.borrow().stack.last() {
+                        if let Ok(store) = self.lock.read() {
+                            if let Some(span) = store.get(id) {
+                                let change2 = *change;
+                                span.with_parent(id, &mut |id, span: Span| {
+                                    if writing_to_cache {
+                                        if span.is_complete() {
+                                            change -= 1;
+                                            f(id, span, &mut *cache)?;
+                                        } else {
+                                            writing_to_cache = false;
+                                            write!(fmt, "{}", cache)?;
+                                            f(id, span, fmt)?;
+                                        }
+                                    } else {
+                                        f(id, span, fmt)?;
+                                    }
+                                    Ok(())
+                                }, &store, change2)?;
+                            }
                         }
-                    } else {
-                        cache.clear();
-                        self.visit_spans(|id, span| f(id, span, &mut *cache))?;
                     }
-                    current.borrow_mut().change = 0;
+                } else if change < 0 {
+                    let mut cache = cache.borrow_mut();
+                    cache.clear();
+                    self.visit_spans(|id, span| f(id, span, &mut *cache))?;
+                    change = 0;
                 }
-
-                write!(fmt, "{}", *cache.borrow())
+                if change == 0 {
+                    write!(fmt, "{}", *cache.borrow())?;
+                }
+                current.borrow_mut().change = change;
+                Ok(())
             })
         }).unwrap_or(Ok(()))
     }
@@ -189,7 +218,7 @@ impl<'a> Context<'a> {
                             // with_parent uses the call stack to visit the span
                             // stack in reverse order, without having to allocate
                             // a buffer.
-                            return span.with_parent(id, &mut f, &store);
+                            return span.with_parent(id, &mut f, &store, -1);
                         }
                     }
                 }
@@ -303,6 +332,7 @@ impl Data {
             parent: Context::current(),
             ref_count: AtomicUsize::new(1),
             is_empty: true,
+            is_complete: false,
         }
     }
 }
@@ -359,6 +389,7 @@ impl Slot {
                     let mut recorder = new_recorder.make(buf, data.is_empty);
                     fields.record(&mut recorder);
                 }
+                data.is_complete = fields.is_complete();
                 if buf.len() != 0 {
                     data.is_empty = false;
                 }
