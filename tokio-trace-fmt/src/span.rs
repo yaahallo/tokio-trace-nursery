@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    mem, str,
+    fmt, mem, str,
     sync::{
         atomic::{self, AtomicUsize, Ordering},
         RwLock,
