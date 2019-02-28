@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    mem, str,
+    fmt, mem, str,
     sync::atomic::{self, AtomicUsize, Ordering},
 };
 
@@ -19,7 +19,6 @@ pub struct Context<'a> {
 }
 
 /// Stores data associated with currently-active spans.
-#[derive(Debug)]
 pub(crate) struct Store {
     // Active span data is stored in a slab of span slots. Each slot has its own
     // read-write lock to guard against concurrent modification to its data.
@@ -41,10 +40,9 @@ pub(crate) struct Data {
     is_empty: bool,
 }
 
-#[derive(Debug)]
 struct Slab {
     slab: Vec<RwLock<Slot>>,
-    slots: AtomicUsize,
+    initial_capacity: usize,
 }
 
 #[derive(Debug)]
@@ -95,7 +93,7 @@ impl<'a> Span<'a> {
     fn with_parent<'store, F, E>(
         self,
         my_id: &Id,
-        last_id: Option<&Id>,
+        // last_id: Option<&Id>,
         f: &mut F,
         store: &'store Store,
     ) -> Result<(), E>
@@ -103,11 +101,11 @@ impl<'a> Span<'a> {
         F: FnMut(&Id, Span) -> Result<(), E>,
     {
         if let Some(parent_id) = self.parent() {
-            if Some(parent_id) != last_id {
-                if let Some(parent) = store.get(parent_id) {
-                    parent.with_parent(parent_id, Some(my_id), f, store)?;
-                }
+            // if Some(parent_id) != last_id {
+            if let Some(parent) = store.get(parent_id) {
+                parent.with_parent(parent_id, f, store)?;
             }
+            // }
         }
         f(my_id, self)
     }
@@ -160,7 +158,7 @@ impl<'a> Context<'a> {
                         // with_parent uses the call stack to visit the span
                         // stack in reverse order, without having to allocate
                         // a buffer.
-                        return span.with_parent(id, None, &mut f, self.store);
+                        return span.with_parent(id, &mut f, self.store);
                     }
                 }
                 Ok(())
@@ -195,10 +193,7 @@ impl<'a> Context<'a> {
 impl Store {
     pub fn with_capacity(capacity: usize) -> Self {
         Store {
-            inner: RwLock::new(Slab {
-                slab: Vec::with_capacity(capacity),
-                slots: AtomicUsize::new(0),
-            }),
+            inner: RwLock::new(Slab::with_capacity(capacity)),
             next: AtomicUsize::new(0),
         }
     }
@@ -234,12 +229,11 @@ impl Store {
 
                 // Can we insert without reallocating?
                 if head < this.slab.len() {
-                    println!("can insert without realloc {:?}", head);
                     // If someone else is writing to the head slot, we need to
                     // acquire a new snapshot!
                     if let Some(mut slot) = this.slab[head].try_write() {
-                        // Is the slot we locked actually empty? If not, fall
-                        // through and try to grow the slab.
+                        // Is the slot we locked actually empty? If not, our
+                        // snapshot is stale.
                         if let Some(next) = slot.next() {
                             // Is our snapshot still valid?
                             if self.next.compare_and_swap(head, next, Ordering::Release) == head {
@@ -263,7 +257,7 @@ impl Store {
                 let mut slot = Slot::new(span.take().unwrap());
                 slot.record(fields, new_recorder);
                 let idx = this.push(slot);
-                println!("next={:?}", idx + 1);
+
                 // Update the head pointer and return.
                 self.next.store(idx + 1, Ordering::Release);
                 return Id::from_u64(idx as u64);
@@ -391,13 +385,25 @@ impl Slot {
 
     fn drop_ref(&self) -> bool {
         match self.span {
-            State::Full(ref data) => data.ref_count.fetch_sub(1, Ordering::Release) == 1,
+            State::Full(ref data) => {
+                // println!("drop {:?}", data.name);
+                data.ref_count.fetch_sub(1, Ordering::Release) == 1
+            }
             State::Empty(_) => false,
         }
     }
 }
 
 impl Slab {
+    fn with_capacity(initial_capacity: usize) -> Self {
+        let mut slab = Self {
+            slab: Vec::with_capacity(initial_capacity),
+            initial_capacity,
+        };
+        slab.push(Slot::empty(1));
+        slab
+    }
+
     #[inline]
     fn write_slot(&self, idx: usize) -> Option<RwLockWriteGuard<Slot>> {
         self.slab.get(idx).map(|slot| slot.write())
@@ -420,7 +426,7 @@ impl Slab {
         // algorithm to push the removed span's index into the free list.
         loop {
             // Get a snapshot of the current free-list head.
-            let head = next.load(Ordering::Relaxed);
+            let head = next.load(Ordering::Acquire);
 
             // Empty the data stored at that slot.
             let mut slot = self.slab[idx].write();
@@ -436,11 +442,10 @@ impl Slab {
 
             // Is our snapshot still valid?
             if next.compare_and_swap(head, idx, Ordering::Release) == head {
-                println!("freed {:?}", idx);
                 // Empty the string but retain the allocated capacity
                 // for future spans.
                 slot.fields.clear();
-                self.slots.fetch_add(1, Ordering::Relaxed);
+                // self.slots.fetch_add(1, Ordering::Relaxed);
                 return Some(data);
             }
 
@@ -449,32 +454,50 @@ impl Slab {
     }
 
     fn push(&mut self, slot: Slot) -> usize {
-        // self.slab.reserve(32);
-        self.slab.push(RwLock::new(slot));
         let len = self.slab.len();
-        print!("push; len={:?}; ", len);
-        // for i in len..len + 30 {
-        //     self.slab.push(RwLock::new(Slot::empty(i + 1)));
-        // }
-        println!("new_len={:?};", self.slab.len());
+
+        self.slab.reserve(self.initial_capacity);
+        self.slab.push(RwLock::new(slot));
+
+        for i in self.slab.len()..len + self.initial_capacity {
+            self.slab.push(RwLock::new(Slot::empty(i + 1)));
+        }
+
         len
-        // let slots = self.slots.load(Ordering::Acquire);
-        // let actual = self.slab.len();
-        // print!("slab::push: slots={:?}; len={:?}", slots, actual);
-        // let capacity = self.slab.capacity();
-        // if slots == 0 {
-        //     print!(" --> should realloc (capacity={:?});", capacity);
-        //     self.slab.reserve(actual + 32);
-        //     self.slab.push(RwLock::new(slot));
-        //     for i in actual + 1..actual + 32 {
-        //         self.slab.push(RwLock::new(Slot::empty(i - 1)));
-        //     }
-        //     self.slots.fetch_add(32, Ordering::Relaxed);
-        // } else {
-        //     self.slab.push(RwLock::new(slot));
-        //     self.slots.fetch_add(1, Ordering::Relaxed);
-        // }
-        // println!("--> real cap={:?};", self.slab.capacity());
-        // actual
+    }
+}
+
+impl fmt::Debug for Slab {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        struct FmtSlot<'a>(&'a RwLock<Slot>);
+        impl<'a> fmt::Debug for FmtSlot<'a> {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                match self.0.try_read() {
+                    Some(inner) => match inner.span {
+                        State::Empty(ref next) => write!(f, "Next({:?})", next),
+                        State::Full(ref data) => write!(f, "Span({:?})", data.name),
+                    },
+                    None => fmt::Display::fmt("<writing>", f),
+                }
+            }
+        }
+
+        f.debug_list()
+            .entries(self.slab.iter().map(|f| FmtSlot(f)))
+            .finish()
+    }
+}
+
+impl fmt::Debug for Store {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut s = f.debug_struct("Store");
+        s.field("next", &self.next.load(Ordering::Acquire));
+        match self.inner.try_read() {
+            Some(slab) => s
+                .field("inner", &*slab)
+                // .field("slots", &slab.slots.load(Ordering::Relaxed))
+                .finish(),
+            None => s.field("inner", &format_args!("{}", "<writing>")).finish(),
+        }
     }
 }

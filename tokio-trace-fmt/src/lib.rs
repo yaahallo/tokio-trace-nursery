@@ -197,7 +197,7 @@ where
             new_recorder: self.new_recorder,
             fmt_event: self.fmt_event,
             filter: self.filter,
-            spans: span::Store::with_capacity(32),
+            spans: span::Store::with_capacity(256),
             settings: self.settings,
         }
     }
