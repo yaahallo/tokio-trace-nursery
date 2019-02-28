@@ -44,6 +44,7 @@ pub(crate) struct Data {
 #[derive(Debug)]
 struct Slab {
     slab: Vec<RwLock<Slot>>,
+    slots: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -196,6 +197,7 @@ impl Store {
         Store {
             inner: RwLock::new(Slab {
                 slab: Vec::with_capacity(capacity),
+                slots: AtomicUsize::new(0),
             }),
             next: AtomicUsize::new(0),
         }
@@ -232,6 +234,7 @@ impl Store {
 
                 // Can we insert without reallocating?
                 if head < this.slab.len() {
+                    println!("can insert without realloc {:?}", head);
                     // If someone else is writing to the head slot, we need to
                     // acquire a new snapshot!
                     if let Some(mut slot) = this.slab[head].try_write() {
@@ -256,18 +259,14 @@ impl Store {
 
             // We need to grow the slab, and must acquire a write lock.
             if let Some(mut this) = self.inner.try_write() {
-                let len = this.slab.len();
-
                 // Insert the span into a new slot.
                 let mut slot = Slot::new(span.take().unwrap());
                 slot.record(fields, new_recorder);
-                this.slab.push(RwLock::new(slot));
-                // TODO: can we grow the slab in chunks to avoid having to
-                // realloc as often?
-
+                let idx = this.push(slot);
+                println!("next={:?}", idx + 1);
                 // Update the head pointer and return.
-                self.next.store(len + 1, Ordering::Release);
-                return Id::from_u64(len as u64);
+                self.next.store(idx + 1, Ordering::Release);
+                return Id::from_u64(idx as u64);
             }
 
             atomic::spin_loop_hint();
@@ -346,6 +345,13 @@ impl Slot {
         Self {
             fields: String::new(),
             span: State::Full(data),
+        }
+    }
+
+    fn empty(next: usize) -> Self {
+        Self {
+            fields: String::new(),
+            span: State::Empty(next),
         }
     }
 
@@ -430,13 +436,45 @@ impl Slab {
 
             // Is our snapshot still valid?
             if next.compare_and_swap(head, idx, Ordering::Release) == head {
+                println!("freed {:?}", idx);
                 // Empty the string but retain the allocated capacity
                 // for future spans.
                 slot.fields.clear();
+                self.slots.fetch_add(1, Ordering::Relaxed);
                 return Some(data);
             }
 
             atomic::spin_loop_hint();
         }
+    }
+
+    fn push(&mut self, slot: Slot) -> usize {
+        // self.slab.reserve(32);
+        self.slab.push(RwLock::new(slot));
+        let len = self.slab.len();
+        print!("push; len={:?}; ", len);
+        // for i in len..len + 30 {
+        //     self.slab.push(RwLock::new(Slot::empty(i + 1)));
+        // }
+        println!("new_len={:?};", self.slab.len());
+        len
+        // let slots = self.slots.load(Ordering::Acquire);
+        // let actual = self.slab.len();
+        // print!("slab::push: slots={:?}; len={:?}", slots, actual);
+        // let capacity = self.slab.capacity();
+        // if slots == 0 {
+        //     print!(" --> should realloc (capacity={:?});", capacity);
+        //     self.slab.reserve(actual + 32);
+        //     self.slab.push(RwLock::new(slot));
+        //     for i in actual + 1..actual + 32 {
+        //         self.slab.push(RwLock::new(Slot::empty(i - 1)));
+        //     }
+        //     self.slots.fetch_add(32, Ordering::Relaxed);
+        // } else {
+        //     self.slab.push(RwLock::new(slot));
+        //     self.slots.fetch_add(1, Ordering::Relaxed);
+        // }
+        // println!("--> real cap={:?};", self.slab.capacity());
+        // actual
     }
 }
